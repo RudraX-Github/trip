@@ -9,6 +9,17 @@ from tempfile import NamedTemporaryFile
 import time
 import re
 import traceback
+import logging
+from typing import Any
+
+# Logging setup for debugging and persistent error capture
+logging.basicConfig(
+    filename="gen_bot.log",
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+import ast
 
 # --- PAGE CONFIG ---
 st.set_page_config(
@@ -103,6 +114,9 @@ def load_whisper():
         st.error(f"Error loading Whisper model: {e}. Ensure ffmpeg is installed.")
         st.stop()
 
+
+# Initialize variable so static analysis and guards can reference it safely
+whisper_model = None
 try:
     whisper_model = load_whisper()
     st.sidebar.success("✅ Whisper model loaded")
@@ -139,6 +153,62 @@ def generate_questions_from_resume(resume_text, api_key):
         client = genai.Client(api_key=api_key)
         st.success("✅ API client ready")
 
+        # Initialize response variables to avoid unbound references in exception handlers
+        raw_response = ""
+        cleaned_text = ""
+
+        def _extract_text_from_response(resp: Any) -> str:
+            """Try multiple shapes returned by API to extract textual content."""
+            try:
+                if resp is None:
+                    return ""
+                # dict-like
+                if isinstance(resp, dict):
+                    for key in ("text", "output", "result"):
+                        if key in resp and resp[key]:
+                            return str(resp[key])
+                    if resp.get("outputs"):
+                        out = resp["outputs"][0]
+                        if isinstance(out, dict):
+                            for k in ("content", "text"):
+                                if k in out and out[k]:
+                                    return str(out[k])
+                            return str(out)
+                        else:
+                            return str(out)
+                    if resp.get("candidates"):
+                        cand = resp["candidates"][0]
+                        if isinstance(cand, dict):
+                            for k in ("content", "text"):
+                                if k in cand and cand[k]:
+                                    return str(cand[k])
+                            return str(cand)
+                        else:
+                            return str(cand)
+                    return str(resp)
+
+                # object-like
+                for attr in ("text", "output", "result", "content", "outputs", "candidates"):
+                    if hasattr(resp, attr):
+                        val = getattr(resp, attr)
+                        if val:
+                            if isinstance(val, list):
+                                first = val[0]
+                                if isinstance(first, dict):
+                                    for k in ("content", "text"):
+                                        if k in first and first[k]:
+                                            return str(first[k])
+                                    return str(first)
+                                else:
+                                    return str(first)
+                            else:
+                                return str(val)
+
+                return str(resp)
+            except Exception:
+                logger.exception("Error extracting text from API response")
+                return str(resp)
+
         with st.spinner("🤖 Analyzing your resume and generating personalized questions..."):
             # Create detailed prompt for 5 questions
             prompt = f"""You are an expert technical interviewer with 15+ years of experience.
@@ -172,70 +242,106 @@ START OUTPUTTING THE LIST NOW:
 
             try:
                 st.info("📡 Sending request to Gemini API...")
-                response = client.models.generate_content(
-                    model="gemini-1.5-flash",
-                    contents=prompt
-                )
-
-                if not response:
-                    st.error("❌ Empty response from API")
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt
+                    )
+                except Exception as api_err:
+                    logger.exception("API request failed")
+                    st.error(f"❌ API request failed: {api_err}")
+                    st.exception(api_err)
                     return []
 
-                if not response.text:
+                # Extract a textual payload from the response flexibly
+                response_text = _extract_text_from_response(response)
+
+                if not response_text or str(response_text).strip() == "":
                     st.error("❌ API returned no text content")
+                    logger.debug("Empty response_text extracted; full response: %s", repr(response))
+                    if st.session_state.get('show_api_debug'):
+                        st.write("Raw response object:")
+                        st.write(repr(response))
                     return []
 
                 st.success("✅ Received response from API")
 
                 # Clean the response
-                raw_response = response.text.strip()
-                st.info(f"📋 Raw API Response (first 200 chars): {raw_response[:200]}")
+                raw_response = str(response_text).strip()
+                logger.debug("Raw API response: %s", raw_response[:1000])
+                if st.session_state.get('show_api_debug'):
+                    st.info(f"📋 Raw API Response (first 200 chars): {raw_response[:200]}")
 
                 # Remove markdown code blocks if present
                 cleaned_text = raw_response.replace("```python", "").replace("```", "").strip()
 
-                # Try to extract list from response
+                # Try to extract list from response using safe literal_eval
                 st.info("🔍 Parsing response...")
                 try:
-                    questions = eval(cleaned_text)
-                except SyntaxError:
-                    # Try to find the list in the response
-                    st.warning("⚠️ Direct eval failed, attempting to extract list...")
+                    questions = ast.literal_eval(cleaned_text)
+                except Exception:
+                    # Try to find the list in the response and parse it
+                    st.warning("⚠️ Direct parse failed, attempting to extract list via regex...")
                     match = re.search(r'\[.*\]', cleaned_text, re.DOTALL)
                     if match:
-                        questions = eval(match.group())
+                        try:
+                            questions = ast.literal_eval(match.group())
+                        except Exception as inner_err:
+                            logger.exception("Failed to parse list from API response")
+                            st.error(f"❌ Failed to parse list from API response: {inner_err}")
+                            if st.session_state.get('show_api_debug'):
+                                st.write("Response fragment:")
+                                st.write(match.group()[:1000])
+                            return []
                     else:
-                        raise ValueError("Could not find valid Python list in response")
+                        logger.error("Could not find Python list in API response")
+                        st.error("❌ Could not find a valid Python list in the API response")
+                        if st.session_state.get('show_api_debug'):
+                            st.write("Raw response snippet:")
+                            st.write(raw_response[:1000])
+                        return []
 
-                # Validate questions
+                # Validate questions and normalize to strings
                 if not isinstance(questions, list):
                     st.error(f"❌ API returned non-list object: {type(questions)}")
+                    logger.error("API returned non-list: %s", repr(questions))
                     return []
 
                 if len(questions) == 0:
                     st.error("❌ API returned an empty list")
+                    logger.warning("Empty questions list from API. cleaned_text=%s", cleaned_text[:500])
                     return []
 
-                # Extract first 5 questions
-                questions = questions[:5]
+                # Normalize entries to clean strings
+                normalized = []
+                for q in questions:
+                    try:
+                        s = str(q).strip()
+                        if s:
+                            normalized.append(s)
+                    except Exception:
+                        logger.exception("Failed to stringify question entry: %s", repr(q))
 
-                # Check for uniqueness
-                unique_questions = list(set(questions))
-                if len(unique_questions) < len(questions):
-                    st.warning(f"⚠️ Found duplicates. Had {len(questions)} questions, {len(unique_questions)} unique")
-                    questions = unique_questions[:5]
+                # Check uniqueness and count
+                unique_questions = []
+                for q in normalized:
+                    if q not in unique_questions:
+                        unique_questions.append(q)
 
-                # Ensure we have 5 questions
-                if len(questions) < 5:
-                    st.warning(f"⚠️ Only {len(questions)} questions generated, expected 5")
+                if len(unique_questions) < 5:
+                    st.warning(f"⚠️ Only {len(unique_questions)} unique questions generated, expected 5")
+                    logger.info("Less than 5 unique questions: %s", unique_questions)
 
-                if len(questions) >= 5:
-                    st.success(f"✅ Successfully generated {len(questions)} personalized questions from your resume!")
-                    st.info("📚 Questions will be asked in order of difficulty")
-                    return questions[:5]
-                else:
-                    st.warning("❌ Not enough questions generated. Please try again.")
+                if len(unique_questions) == 0:
+                    st.error("❌ No valid questions could be parsed from the API response.")
+                    if st.session_state.get('show_api_debug'):
+                        st.write("Cleaned text:")
+                        st.write(cleaned_text[:2000])
                     return []
+
+                st.success(f"✅ Successfully parsed {len(unique_questions)} question(s) from API response")
+                st.info("📚 Questions will be asked in order of difficulty")
+                return unique_questions[:5]
 
             except SyntaxError as syntax_error:
                 st.error(f"❌ Syntax Error parsing response: {syntax_error}")
@@ -357,8 +463,9 @@ def get_ai_feedback(question, answer, api_key):
         """
 
         try:
+            model_to_use = st.session_state.get('model_name', 'gemini-2.5-flash')
             response = client.models.generate_content(
-                model="gemini-1.5-flash",
+                model=model_to_use,
                 contents=prompt
             )
 
@@ -401,6 +508,18 @@ with st.sidebar:
     )
     if api_key_input:
         st.session_state.api_key = api_key_input
+
+    # Model selection for Gemini (helps when default model is not available)
+    model_input = st.text_input(
+        "Gemini Model Name",
+        value=st.session_state.get('model_name', 'gemini-1.5-flash')
+    )
+    if model_input:
+        st.session_state.model_name = model_input
+
+    # Optionally show API debug info in the main UI
+    show_api_debug = st.checkbox("Show API Debug Info", value=False)
+    st.session_state.show_api_debug = show_api_debug
 
     st.markdown("---")
     st.subheader("1. Upload Resume")
@@ -492,12 +611,16 @@ else:
                                 st.info(f"📋 Debug - Language: {lang_code}")
 
                             # Transcribe with better error handling
-                            result = whisper_model.transcribe(
-                                audio_file,
-                                language=lang_code,
-                                fp16=False,  # Ensure compatibility
-                                verbose=debug_mode
-                            )
+                            if 'whisper_model' not in globals() or whisper_model is None:
+                                st.error("❌ Whisper model is not loaded. Cannot transcribe audio.")
+                                result = {"text": ""}
+                            else:
+                                result = whisper_model.transcribe(
+                                    audio_file,
+                                    language=lang_code,
+                                    fp16=False,  # Ensure compatibility
+                                    verbose=debug_mode
+                                )
 
                             transcription = result.get("text", "").strip()
 
